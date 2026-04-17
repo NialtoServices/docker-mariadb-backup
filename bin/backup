@@ -1,0 +1,71 @@
+#!/bin/ash
+
+set -o pipefail
+umask 077
+
+info() {
+  echo "$(basename "$0") [$(date +'%Y-%m-%d %H:%M:%S %Z')]  INFO: $*" >&2
+}
+
+warn() {
+  echo "$(basename "$0") [$(date +'%Y-%m-%d %H:%M:%S %Z')]  WARN: $*" >&2
+}
+
+fatal() {
+  echo "$(basename "$0") [$(date +'%Y-%m-%d %H:%M:%S %Z')] FATAL: $*" >&2
+  exit 1
+}
+
+cleanup() {
+  [ -n "${DUMP_PATH:-}" ] && rm -f "${DUMP_PATH}"
+}
+
+[ "$(id -u)" -eq 0 ] || fatal "superuser privileges are required to perform a backup"
+
+BACKUP_LOCKFILE_PATH="/run/lock/backup.lock"
+
+info "acquiring lock on ${BACKUP_LOCKFILE_PATH}"
+mkdir -p "$(dirname "${BACKUP_LOCKFILE_PATH}")" || fatal "failed to create lock directory"
+exec 9>"${BACKUP_LOCKFILE_PATH}"
+flock -x -n 9 || fatal "another backup is already running"
+
+echo "$$" > "${BACKUP_LOCKFILE_PATH}"
+
+trap cleanup INT TERM EXIT
+
+MARIADB_PORT="${MARIADB_PORT:-3306}"
+
+[ -n "${MARIADB_HOST:-}" ] || fatal "'MARIADB_HOST' is not set"
+[ -n "${MARIADB_USER:-}" ] || fatal "'MARIADB_USER' is not set"
+[ -n "${MARIADB_PASSWORD:-}" ] || fatal "'MARIADB_PASSWORD' is not set"
+[ -n "${MARIADB_DB:-}" ] || fatal "'MARIADB_DB' is not set"
+[ -n "${RCLONE_REMOTE:-}" ] || fatal "'RCLONE_REMOTE' is not set"
+
+DUMP_FILENAME="${MARIADB_DB}.sql.zst"
+DUMP_PATH="/tmp/${DUMP_FILENAME}"
+
+# Pass the password via env so it does not appear in `ps`.
+export MYSQL_PWD="${MARIADB_PASSWORD}"
+
+info "dumping database '${MARIADB_DB}' to ${DUMP_PATH}"
+mariadb-dump \
+  --host="${MARIADB_HOST}" \
+  --port="${MARIADB_PORT}" \
+  --user="${MARIADB_USER}" \
+  --single-transaction \
+  --quick \
+  --routines \
+  --triggers \
+  --events \
+  --no-tablespaces \
+  --skip-dump-date \
+  "${MARIADB_DB}" \
+  | zstd -T0 -19 --long -o "${DUMP_PATH}" \
+  || fatal "failed to dump database '${MARIADB_DB}'"
+
+info "uploading ${DUMP_FILENAME} to ${RCLONE_REMOTE}"
+rclone copyto \
+  "${DUMP_PATH}" \
+  "${RCLONE_REMOTE}/${DUMP_FILENAME}" || fatal "failed to upload dump to ${RCLONE_REMOTE}"
+
+info "backup complete: ${RCLONE_REMOTE}/${DUMP_FILENAME}"
